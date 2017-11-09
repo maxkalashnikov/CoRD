@@ -48,6 +48,7 @@
 RDStreamRef
 tcp_init(RDConnectionRef conn, uint32 maxlen)
 {
+	DEBUG(("tcp_init()\n"));
 	if (maxlen > conn->outStream.size)
 	{
 		conn->outStream.data = (uint8 *) xrealloc(conn->outStream.data, maxlen);

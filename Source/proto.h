@@ -73,7 +73,7 @@ int mppc_expand(RDConnectionRef conn, uint8 * data, uint32 clen, uint8 ctype, ui
 RDStreamRef iso_init(RDConnectionRef conn, int length);
 void iso_send(RDConnectionRef conn, RDStreamRef s);
 RDStreamRef iso_recv(RDConnectionRef conn, uint8 * rdpver);
-RD_BOOL iso_connect(RDConnectionRef conn, const char *server, char *username, RD_BOOL reconnect);
+RD_BOOL iso_connect(RDConnectionRef conn, char *server, char *username, char *domain, char *password, RD_BOOL reconnect, uint32 * selected_protocol);
 void iso_disconnect(RDConnectionRef conn);
 void iso_reset_state(RDConnectionRef conn);
 
@@ -88,6 +88,8 @@ void mcs_send_to_channel(RDConnectionRef conn, RDStreamRef s, uint16 channel);
 void mcs_send(RDConnectionRef conn, RDStreamRef s);
 RDStreamRef mcs_recv(RDConnectionRef conn, uint16 * channel, uint8 * rdpver);
 RD_BOOL mcs_connect(RDConnectionRef conn, const char *server, RDStreamRef mcs_data, char *username, RD_BOOL reconnect);
+RD_BOOL mcs_connect_start(RDConnectionRef conn, char *server, char *username, char *domain, char *password, RD_BOOL reconnect, uint32 * selected_protocol);
+RD_BOOL mcs_connect_finalize(RDConnectionRef conn, RDStreamRef mcs_data);
 void mcs_disconnect(RDConnectionRef conn);
 void mcs_reset_state(RDConnectionRef conn);
 
@@ -200,6 +202,8 @@ void wave_out_play(void);
 #pragma mark secure.c
 void sec_hash_48(uint8 * out, uint8 * in, uint8 * salt1, uint8 * salt2, uint8 salt);
 void sec_hash_16(uint8 * out, uint8 * in, uint8 * salt1, uint8 * salt2);
+void sec_hash_sha1_16(uint8 * out, uint8 * in, uint8 * salt1);
+void sec_hash_to_string(char *out, int out_size, uint8 * in, int in_size);
 void buf_out_uint32(uint8 * buffer, uint32 value);
 void sec_sign(uint8 * signature, int siglen, uint8 * session_key, int keylen, uint8 * data, int datalen);
 void sec_decrypt(RDConnectionRef conn, uint8 * data, int length);
@@ -208,7 +212,7 @@ void sec_send_to_channel(RDConnectionRef conn, RDStreamRef s, uint32 flags, uint
 void sec_send(RDConnectionRef conn, RDStreamRef s, uint32 flags);
 void sec_process_mcs_data(RDConnectionRef conn, RDStreamRef s);
 RDStreamRef sec_recv(RDConnectionRef conn, uint8 * rdpver);
-RD_BOOL sec_connect(RDConnectionRef conn, const char *server, char *username, RD_BOOL reconnect);
+RD_BOOL sec_connect(RDConnectionRef conn, char *server, char *username, char *domain, char *password, RD_BOOL reconnect);
 void sec_disconnect(RDConnectionRef conn);
 void sec_reset_state(RDConnectionRef conn);
 

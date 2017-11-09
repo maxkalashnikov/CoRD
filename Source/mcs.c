@@ -1,24 +1,25 @@
 /* -*- c-basic-offset: 8 -*-
    rdesktop: A Remote Desktop Protocol client.
    Protocol services - Multipoint Communications Service
-   Copyright (C) Matthew Chapman 1999-2008
-   
-   This program is free software; you can redistribute it and/or modify
+   Copyright (C) Matthew Chapman <matthewc.unsw.edu.au> 1999-2008
+   Copyright 2005-2011 Peter Astrand <astrand@cendio.se> for Cendio AB
+
+   This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; either version 2 of the License, or
+   the Free Software Foundation, either version 3 of the License, or
    (at your option) any later version.
-   
+
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
    GNU General Public License for more details.
-   
+
    You should have received a copy of the GNU General Public License
-   along with this program; if not, write to the Free Software
-   Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 #import "rdesktop.h"
+
 
 /* Parse an ASN.1 BER header */
 static RD_BOOL
@@ -161,7 +162,7 @@ mcs_recv_connect_response(RDConnectionRef conn, RDStreamRef mcs_data)
 	in_uint8(s, result);
 	if (result != 0)
 	{
-		error("MCS connect: %d\n", result);
+		error("mcs_recv_connect_response(), result=%d", result);
 		return False;
 	}
 
@@ -175,8 +176,8 @@ mcs_recv_connect_response(RDConnectionRef conn, RDStreamRef mcs_data)
 	/*
 	   if (length > mcs_data->size)
 	   {
-	   error("MCS data length %d, expected %d\n", length,
-	   mcs_data->size);
+	   error("mcs_recv_connect_response(), expected length=%d, got %d",length, 
+		mcs_data->size);
 	   length = mcs_data->size;
 	   }
 
@@ -231,14 +232,14 @@ mcs_recv_aucf(RDConnectionRef conn)
 	in_uint8(s, opcode);
 	if ((opcode >> 2) != MCS_AUCF)
 	{
-		error("expected AUcf, got %d\n", opcode);
+		error("mcs_recv_aucf(), expected opcode AUcf, got %d", opcode);
 		return False;
 	}
 
 	in_uint8(s, result);
 	if (result != 0)
 	{
-		error("AUrq: %d\n", result);
+		error("mcs_recv_aucf(), expected result 0, got %d", result);
 		return False;
 	}
 
@@ -254,7 +255,7 @@ mcs_send_cjrq(RDConnectionRef conn, uint16 chanid)
 {
 	RDStreamRef s;
 
-	DEBUG_RDP5(("Sending CJRQ for channel #%d\n", chanid));
+	DEBUG_RDP5(("mcs_send_cjrq(), chanid=%d", chanid));
 
 	s = iso_init(conn, 5);
 
@@ -280,14 +281,14 @@ mcs_recv_cjcf(RDConnectionRef conn)
 	in_uint8(s, opcode);
 	if ((opcode >> 2) != MCS_CJCF)
 	{
-		error("expected CJcf, got %d\n", opcode);
+		error("mcs_recv_cjcf(), expected opcode CJcf, got %d", opcode);
 		return False;
 	}
 
 	in_uint8(s, result);
 	if (result != 0)
 	{
-		error("CJrq: %d\n", result);
+		error("mcs_recv_cjcf(), expected result 0, got %d", result);
 		return False;
 	}
 
@@ -355,7 +356,7 @@ mcs_recv(RDConnectionRef conn, uint16 * channel, uint8 * rdpver)
 	{
 		if (appid != MCS_DPUM)
 		{
-			error("expected data, got %d\n", opcode);
+			error("mcs_recv(), expected data, got %d", opcode);
 		}
 		return NULL;
 	}
@@ -367,14 +368,19 @@ mcs_recv(RDConnectionRef conn, uint16 * channel, uint8 * rdpver)
 		in_uint8s(s, 1);	/* second byte of length */
 	return s;
 }
+
 /* Establish a connection up to the MCS layer */
 RD_BOOL
-mcs_connect(RDConnectionRef conn, const char *server, RDStreamRef mcs_data, char *username, RD_BOOL reconnect)
+mcs_connect_start(RDConnectionRef conn, char *server, char *username, char *domain, char *password,
+		  RD_BOOL reconnect, uint32 * selected_protocol)
+{
+	return iso_connect(conn, server, username, domain, password, reconnect, selected_protocol);
+}
+
+RD_BOOL
+mcs_connect_finalize(RDConnectionRef conn, RDStreamRef mcs_data)
 {
 	unsigned int i;
-
-	if (!iso_connect(conn, server, username, reconnect))
-		return False;
 
 	mcs_send_connect_initial(conn, mcs_data);
 	if (!mcs_recv_connect_response(conn, mcs_data))
@@ -386,7 +392,7 @@ mcs_connect(RDConnectionRef conn, const char *server, RDStreamRef mcs_data, char
 	if (!mcs_recv_aucf(conn))
 		goto error;
 
-	mcs_send_cjrq(conn, conn->mcsUserid + MCS_USERCHANNEL_BASE);
+	    mcs_send_cjrq(conn, conn->mcsUserid + MCS_USERCHANNEL_BASE);
 
 	if (!mcs_recv_cjcf(conn))
 		goto error;

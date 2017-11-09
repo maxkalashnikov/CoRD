@@ -1398,7 +1398,7 @@ RD_BOOL
 rdp_connect(RDConnectionRef conn, const char *server, uint32 flags, NSString *domain, NSString *username, NSString *password,
 	    const char *command, const char *directory, RD_BOOL reconnect)
 {
-	if (!sec_connect(conn, server, conn->username, reconnect))
+	if (!sec_connect(conn, (char *)server, conn->username, (char *)domain, (char *)password, reconnect))
 		return False;
 
 	rdp_send_logon_info(conn, flags, domain, username, password, command, directory);

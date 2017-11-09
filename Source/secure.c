@@ -1,11 +1,13 @@
 /* -*- c-basic-offset: 8 -*-
    rdesktop: A Remote Desktop Protocol client.
    Protocol services - RDP encryption and licensing
-   Copyright (C) Matthew Chapman 1999-2008
+   Copyright (C) Matthew Chapman <matthewc.unsw.edu.au> 1999-2008
+   Copyright 2005-2011 Peter Astrand <astrand@cendio.se> for Cendio AB
+   Copyright 2017 Henrik Andersson <hean01@cendio.se> for Cendio AB
 
-   This program is free software; you can redistribute it and/or modify
+   This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; either version 2 of the License, or
+   the Free Software Foundation, either version 3 of the License, or
    (at your option) any later version.
 
    This program is distributed in the hope that it will be useful,
@@ -14,11 +16,79 @@
    GNU General Public License for more details.
 
    You should have received a copy of the GNU General Public License
-   along with this program; if not, write to the Free Software
-   Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 #import "rdesktop.h"
+#import "ssl.h"
+#import <iconv.h>
+
+int g_width = 800;
+int g_height = 600;
+int g_dpi = 0;			/* device DPI: default not set */
+unsigned int g_keylayout = 0x409;	/* Defaults to US keyboard layout */
+int g_keyboard_type = 0x4;	/* Defaults to US keyboard layout */
+int g_keyboard_subtype = 0x0;	/* Defaults to US keyboard layout */
+int g_keyboard_functionkeys = 0xc;	/* Defaults to US keyboard layout */
+uint32 g_redirect_session_id = 0;
+char g_codepage[16] = "";
+
+#define SEC_EXCHANGE_PKT	0x0001
+#define RDP_40		0x00080001	/* RDP 4.0 clients */
+#define RDP_50		0x00080004	/* RDP 5.0, 5.1, 5.2, 6.0, 6.1, 7.0, 7.1, 8.0, and 8.1 clients */
+
+#define RNS_UD_COLOR_4BPP	0xCA00
+#define RNS_UD_COLOR_8BPP	0xCA01
+#define RNS_UD_COLOR_16BPP_555	0xCA02
+#define RNS_UD_COLOR_16BPP_565	0xCA03
+#define RNS_UD_COLOR_24BPP	0xCA04
+#define RNS_UD_SAS_DEL		0xAA03
+#define RNS_UD_CS_SUPPORT_ERRINFO_PDU		0x0001
+#define RNS_UD_24BPP_SUPPORT	0x0001
+#define RNS_UD_16BPP_SUPPORT	0x0002
+#define RNS_UD_15BPP_SUPPORT	0x0004
+#define RNS_UD_32BPP_SUPPORT	0x0008
+/* earlyCapabilityFlags, [MS-RDPBCGR] 2.2.1.3.2 */
+#define RNS_UD_CS_SUPPORT_ERRINFO_PDU		0x0001
+#define RNS_UD_CS_WANT_32BPP_SESSION		0x0002
+#define RNS_UD_CS_SUPPORT_STATUSINFO_PDU	0x0004
+#define RNS_UD_CS_STRONG_ASYMMETRIC_KEYS	0x0008
+#define RNS_UD_CS_UNUSED			0x0010
+#define RNS_UD_CS_VALID_CONNECTION_TYPE		0x0020
+#define RNS_UD_CS_SUPPORT_MONITOR_LAYOUT_PDU	0x0040
+#define RNS_UD_CS_SUPPORT_NETCHAR_AUTODETECT	0x0080
+#define RNS_UD_CS_SUPPORT_DYNVC_GFX_PROTOCOL	0x0100
+#define RNS_UD_CS_SUPPORT_DYNAMIC_TIME_ZONE	0x0200
+#define RNS_UD_CS_SUPPORT_HEARTBEAT_PDU		0x0400
+
+#define CS_CORE			0xc001
+#define CS_SECURITY		0xc002
+#define CS_NET			0xc003
+#define CS_CLUSTER		0xc004
+/* desktop orientation */
+enum RDP_DESKTOP_ORIENTATION
+{
+	ORIENTATION_LANDSCAPE = 0,
+	ORIENTATION_PORTRAIT = 90,
+	ORIENTATION_LANDSCAPE_FLIPPED = 180,
+	ORIENTATION_PORTRAIT_FLIPPED = 270
+};
+/* Client cluster constants */
+#define SEC_CC_REDIRECTION_SUPPORTED          0x00000001
+#define SEC_CC_REDIRECT_SESSIONID_FIELD_VALID 0x00000002
+#define SEC_CC_REDIRECTED_SMARTCARD           0x00000040
+#define SEC_CC_REDIRECT_VERSION_MASK          0x0000003c
+
+#define SEC_CC_REDIRECT_VERSION_3             0x02
+#define SEC_CC_REDIRECT_VERSION_4             0x03
+#define SEC_CC_REDIRECT_VERSION_5             0x04
+#define SEC_CC_REDIRECT_VERSION_6             0x05
+/* TS_SECURITY_HEADER.flags */
+#define SEC_LICENSE_PKT		0x0080
+#define SEC_REDIRECTION_PKT	0x0400
+
+#define WINDOWS_CODEPAGE	"UTF-16LE"
+#define s_left(s)               ((s)->size - ((s)->p - (s)->data))
 
 /*
  * I believe this is based on SSLv3 with the following differences:
@@ -76,6 +146,31 @@ sec_hash_16(uint8 * out, uint8 * in, uint8 * salt1, uint8 * salt2)
 	MD5_Final(out, &md5);
 }
 
+/*
+ * 16-byte sha1 hash
+ */
+void
+sec_hash_sha1_16(uint8 * out, uint8 * in, uint8 * salt1)
+{
+	SHA_CTX sha1;
+	SHA1_Init(&sha1);
+	SHA1_Update(&sha1, in, 16);
+	SHA1_Update(&sha1, salt1, 16);
+	SHA1_Final(out, &sha1);
+}
+
+/* create string from hash */
+void
+sec_hash_to_string(char *out, int out_size, uint8 * in, int in_size)
+{
+	int k;
+	memset(out, 0, out_size);
+	for (k = 0; k < in_size; k++, out += 2)
+	{
+		sprintf(out, "%.2x", in[k]);
+	}
+}
+
 /* Reduce key entropy from 64 to 40 bits */
 static void
 sec_make_40bit(uint8 * key)
@@ -110,7 +205,7 @@ sec_generate_keys(RDConnectionRef conn, uint8 * client_random, uint8 * server_ra
 
 	if (rc4_key_size == 1)
 	{
-		DEBUG(("40-bit encryption enabled\n"));
+		DEBUG(("sec_generate_keys(), 40-bit encryption enabled"));
 		sec_make_40bit(conn->secSignKey);
 		sec_make_40bit(conn->secDecryptKey);
 		sec_make_40bit(conn->secEncryptKey);
@@ -118,7 +213,7 @@ sec_generate_keys(RDConnectionRef conn, uint8 * client_random, uint8 * server_ra
 	}
 	else
 	{
-		DEBUG(("rc_4_key_size == %d, 128-bit encryption enabled\n", rc4_key_size));
+		DEBUG(("sec_generate_key(), rc_4_key_size == %d, 128-bit encryption enabled", rc4_key_size));
 		conn->rc4KeyLen = 16;
 	}
 
@@ -230,7 +325,6 @@ sec_encrypt(RDConnectionRef conn, uint8 * data, int length)
 void
 sec_decrypt(RDConnectionRef conn, uint8 * data, int length)
 {
-	
 	if (conn->secDecryptUseCount == 4096)
 	{
 		sec_update(conn, conn->secDecryptKey, conn->secDecryptUpdateKey);
@@ -283,7 +377,7 @@ sec_rsa_encrypt(uint8 * out, uint8 * in, int len, uint32 modulus_size, uint8 * m
 	BN_mod_exp(&y, &x, &exp, &mod, ctx);
 	outlen = BN_bn2bin(&y, out);
 	reverse(out, outlen);
-	if (outlen < modulus_size)
+	if (outlen < (int) modulus_size)
 		memset(out + outlen, 0, modulus_size - outlen);
 
 	BN_free(&y);
@@ -351,7 +445,7 @@ static void
 sec_establish_key(RDConnectionRef conn)
 {
 	uint32 length = conn->serverPublicKeyLen + SEC_PADDING_SIZE;
-	uint32 flags = SEC_CLIENT_RANDOM;
+	uint32 flags = SEC_EXCHANGE_PKT;
 	RDStreamRef s;
 
 	s = sec_init(conn, flags, length + 4);
@@ -364,19 +458,34 @@ sec_establish_key(RDConnectionRef conn)
 	sec_send(conn, s, flags);
 }
 
+static iconv_t
+local_to_utf16()
+{
+  iconv_t icv;
+  icv = iconv_open(WINDOWS_CODEPAGE, g_codepage);
+  if (icv == (iconv_t) - 1)
+  {
+	  error("locale_to_utf16(), iconv_open[%s -> %s] fail %p",g_codepage, WINDOWS_CODEPAGE, icv);
+    abort();
+  }
+  return icv;
+}
+
 /* Output connect initial data blob */
 static void
-sec_out_mcs_data(RDConnectionRef conn, RDStreamRef s)
+sec_out_mcs_connect_initial_pdu(RDConnectionRef conn, RDStreamRef s, uint32 selected_protocol)
 {
-	int hostlen = 2 * strlen(conn->hostname);
-	int length = 158 + 76 + 12 + 4;
+	int length = 162 + 76 + 12 + 4 + (g_dpi > 0 ? 18 : 0);
 	unsigned int i;
+	uint32 rdpversion = RDP_40;
+	uint16 capflags = RNS_UD_CS_SUPPORT_ERRINFO_PDU;
+	uint16 colorsupport = RNS_UD_24BPP_SUPPORT | RNS_UD_16BPP_SUPPORT | RNS_UD_32BPP_SUPPORT;
+
+	if (conn->useRdp5 >= RDP_V5)
+		rdpversion = RDP_50;
 
 	if (conn->numChannels > 0)
 		length += conn->numChannels * 12 + 8;
-
-	if (hostlen > 30)
-		hostlen = 30;
 
 	/* Generic Conference Control (T.124) ConferenceCreateRequest */
 	out_uint16_be(s, 5);
@@ -395,58 +504,120 @@ sec_out_mcs_data(RDConnectionRef conn, RDStreamRef s)
 	out_uint32_le(s, 0x61637544);	/* OEM ID: "Duca", as in Ducati. */
 	out_uint16_be(s, ((length - 14) | 0x8000));	/* remaining length */
 
-	/* Client information - MS-RDPBCGR.pdf page 32-37 */
-	out_uint16_le(s, SEC_TAG_CLI_INFO);
-	out_uint16_le(s, 212);	/* length */
-	out_uint16_le(s, conn->useRdp5 ? 4 : 1);	/* RDP version. 1 == RDP4, 4 == RDP5. */
-	out_uint16_le(s, 8);
-	out_uint16_le(s, conn->screenWidth);
-	out_uint16_le(s, conn->screenHeight);
-	out_uint16_le(s, 0xca01);
-	out_uint16_le(s, 0xaa03);
-	out_uint32_le(s, conn->keyboardLayout);
-	out_uint32_le(s, 2600);	/* Client build. We are now 2600 compatible :-) */
+	/* Client information (TS_UD_CS_CORE) */
+	out_uint16_le(s, CS_CORE);		/* type */
+	out_uint16_le(s, 216 + (g_dpi > 0 ? 18 : 0));	/* length */
+	out_uint32_le(s, rdpversion);           /* version */
+	out_uint16_le(s, g_width);		/* desktopWidth */
+	out_uint16_le(s, g_height);		/* desktopHeight */
+	out_uint16_le(s, RNS_UD_COLOR_8BPP);	/* colorDepth */
+	out_uint16_le(s, RNS_UD_SAS_DEL);	/* SASSequence */
+	out_uint32_le(s, g_keylayout);		/* keyboardLayout */
+	out_uint32_le(s, 2600);			/* Client build. We are now 2600 compatible :-) */
 
 	/* Unicode name of client, padded to 32 bytes */
-	rdp_out_unistr(s, conn->hostname, hostlen);
-	out_uint8s(s, 30 - hostlen);
+	/*out_utf16s_padded(s, conn->hostname, 32, 0x00);*/
+	size_t j;
 
-	/* See http://msdn.microsoft.com/library/default.asp?url=/library/en-us/wceddk40/html/cxtsksupportingremotedesktopprotocol.asp */
-	out_uint32_le(s, conn->keyboardType);
-	out_uint32_le(s, conn->keyboardSubtype);
-	out_uint32_le(s, conn->keyboardFunctionkeys);
+	/*bl = _out_utf16s(s, 32 - 2, conn->hostname);*/
 
-	out_uint8s(s, 64);	/* reserved? 4 + 12 doublewords */
-	out_uint16_le(s, 0xca01);	/* colour depth? */
-	out_uint16_le(s, 1);
+        static iconv_t icv_local_to_utf16;
+	size_t bl, ibl, obl;
+	const char *pin;
+	char *pout;
 
-	out_uint32(s, 0);
-	out_uint16_le(s, conn->serverBpp == 32 ? 24 : conn->serverBpp); /* field limited to 24bpp */
-	out_uint16_le(s, 0x000F); /* supported color depths = 24bpp | 16bpp | 15bpp | 32bpp */ 
-	out_uint16_le(s, 0x0000 | ((conn->serverBpp == 24 || conn->serverBpp == 32) ? 0x0002 : 0x0000)); /* early capability flags, signal 32bpp session (0x2) */
-	out_uint8s(s, 64);	/* digital client product id */
-	out_uint8s(s, 2); /* padding - End of client info */
+	if (conn->hostname == NULL)
+		bl = 0;
 
-	out_uint16_le(s, SEC_TAG_CLI_4);
-	out_uint16_le(s, 12);
-	out_uint32_le(s, conn->consoleSession ? 0xb : 9);
-	out_uint32(s, 0);
+	if (!icv_local_to_utf16)
+    	{
+      	icv_local_to_utf16 = local_to_utf16();
+    	}
 
-	/* Client encryption settings */
-	out_uint16_le(s, SEC_TAG_CLI_CRYPT);
+	ibl = strlen(conn->hostname);
+	obl = 30 ? 30 : (size_t)s_left(s);
+  	pin = conn->hostname;
+        pout = (char *) s->p;
+
+	if (iconv(icv_local_to_utf16, (char **) &pin, &ibl, &pout, &obl) == (size_t) - 1)
+	{
+		error("out_utf16s(), iconv(2) fail, errno %d", errno);
+		abort();
+    	}
+	bl = (unsigned char*)pout - s->p;
+	s->p = (unsigned char *)pout;	
+
+
+	// append utf16 null termination
+	out_uint16(s, 0);
+	bl += 2;
+
+	for (j = 0; j < (length - bl); j++)
+    	out_uint8(s, 0x00);
+
+	out_uint32_le(s, g_keyboard_type);	/* keyboardType */
+	out_uint32_le(s, g_keyboard_subtype);	/* keyboardSubtype */
+	out_uint32_le(s, g_keyboard_functionkeys); /* keyboardFunctionKey */
+	out_uint8s(s, 64);			/* imeFileName */
+	out_uint16_le(s, RNS_UD_COLOR_8BPP);	/* postBeta2ColorDepth (overrides colorDepth) */
+	out_uint16_le(s, 1);			/* clientProductId (should be 1) */
+	out_uint32_le(s, 0);			/* serialNumber (should be 0) */
+
+	/* highColorDepth (overrides postBeta2ColorDepth). Capped at 24BPP.
+	   To get 32BPP sessions, we need to set a capability flag. */
+	out_uint16_le(s, MIN(conn->serverBpp, 24));
+	if (conn->serverBpp == 32)
+		capflags |= RNS_UD_CS_WANT_32BPP_SESSION;
+
+	out_uint16_le(s, colorsupport);		/* supportedColorDepths */
+	out_uint16_le(s, capflags);		/* earlyCapabilityFlags */
+	out_uint8s(s, 64);			/* clientDigProductId */
+	out_uint8(s, 0);			/* connectionType */
+	out_uint8(s, 0);			/* pad */
+	out_uint32_le(s, selected_protocol);	/* serverSelectedProtocol */
+	if (g_dpi > 0)
+	{
+		/* Extended client info describing monitor geometry */
+		out_uint32_le(s, g_width * 254 / (g_dpi * 10)); /* desktop physical width */
+		out_uint32_le(s, g_height * 254 / (g_dpi * 10)); /* desktop physical height */
+		out_uint16_le(s, ORIENTATION_LANDSCAPE);
+		out_uint32_le(s, g_dpi < 96 ? 100 : (g_dpi * 100 + 48) / 96); /* desktop scale factor */
+		/* the spec calls this out as being valid for range 100-500 but I doubt the upper range is accurate */
+		out_uint32_le(s, g_dpi < 134 ? 100 : (g_dpi < 173 ? 140 : 180)); /* device scale factor */
+		/* the only allowed values for device scale factor are 100, 140, and 180. */
+	}
+
+	/* Write a Client Cluster Data (TS_UD_CS_CLUSTER) */
+	uint32 cluster_flags = 0;
+	out_uint16_le(s, CS_CLUSTER);	/* header.type */
 	out_uint16_le(s, 12);	/* length */
-	out_uint32_le(s, conn->useEncryption ? 0x3 : 0);	/* encryption supported, 128-bit supported */
-	out_uint32(s, 0);	/* Unknown */
 
-	DEBUG_RDP5(("conn->numChannels is %d\n", conn->numChannels));
+	cluster_flags |= SEC_CC_REDIRECTION_SUPPORTED;
+	cluster_flags |= (SEC_CC_REDIRECT_VERSION_3 << 2);
+
+	if (conn->consoleSession || g_redirect_session_id != 0)
+		cluster_flags |= SEC_CC_REDIRECT_SESSIONID_FIELD_VALID;
+
+	out_uint32_le(s, cluster_flags);
+	out_uint32(s, g_redirect_session_id);
+
+	/* Client encryption settings (TS_UD_CS_SEC) */
+	out_uint16_le(s, CS_SECURITY);			/* type */
+	out_uint16_le(s, 12);				/* length */
+	out_uint32_le(s, conn->useEncryption ? 0x3 : 0);	/* encryptionMethods */
+	out_uint32(s, 0);				/* extEncryptionMethods */
+
+	/* Channel definitions (TS_UD_CS_NET) */
+	DEBUG(("sec_out_mcs_data(), conn->numChannels is %d", conn->numChannels));
 	if (conn->numChannels > 0)
 	{
-		out_uint16_le(s, SEC_TAG_CLI_CHANNELS);
+		out_uint16_le(s, CS_NET);			/* type */
 		out_uint16_le(s, conn->numChannels * 12 + 8);	/* length */
 		out_uint32_le(s, conn->numChannels);	/* number of virtual channels */
 		for (i = 0; i < conn->numChannels; i++)
 		{
-			DEBUG_RDP5(("Requesting channel %s\n", conn->channels[i].name));
+			DEBUG(("sec_out_mcs_data(), requesting channel %s",
+				conn->channels[i].name));
 			out_uint8a(s, conn->channels[i].name, 8);
 			out_uint32_be(s, conn->channels[i].flags);
 		}
@@ -457,90 +628,79 @@ sec_out_mcs_data(RDConnectionRef conn, RDStreamRef s)
 
 /* Parse a public key structure */
 static RD_BOOL
-sec_parse_public_key(RDConnectionRef conn, RDStreamRef s, uint8 ** modulus, uint8 ** exponent)
+sec_parse_public_key(RDConnectionRef conn, RDStreamRef s, uint8 * modulus, uint8 * exponent)
 {
 	uint32 magic, modulus_len;
 
 	in_uint32_le(s, magic);
 	if (magic != SEC_RSA_MAGIC)
 	{
-		error("RSA magic 0x%x\n", magic);
+		error("sec_parse_public_key(), magic (0x%x) != SEC_RSA_MAGIC", magic);
 		return False;
 	}
 
 	in_uint32_le(s, modulus_len);
 	modulus_len -= SEC_PADDING_SIZE;
-	if ((modulus_len < 64) || (modulus_len > SEC_MAX_MODULUS_SIZE))
+	if ((modulus_len < SEC_MODULUS_SIZE) || (modulus_len > SEC_MAX_MODULUS_SIZE))
 	{
-		error("Bad server public key size (%u bits)\n", modulus_len * 8);
+		error("sec_parse_public_key(), invalid public key size (%u bits) from server", modulus_len * 8);
 		return False;
 	}
 
 	in_uint8s(s, 8);	/* modulus_bits, unknown */
-	in_uint8p(s, *exponent, SEC_EXPONENT_SIZE);
-	in_uint8p(s, *modulus, modulus_len);
+	in_uint8p(s, exponent, SEC_EXPONENT_SIZE);
+	in_uint8p(s, modulus, modulus_len);
 	in_uint8s(s, SEC_PADDING_SIZE);
 	conn->serverPublicKeyLen = modulus_len;
-	
+
 	return s_check(s);
 }
 
+/* Parse a public signature structure */
 static RD_BOOL
-sec_parse_x509_key(RDConnectionRef conn, X509 * cert)
+sec_parse_public_sig(RDConnectionRef conn, RDStreamRef s, uint32 len, uint8 * modulus, uint8 * exponent)
 {
-	EVP_PKEY *epk = NULL;
-	/* By some reason, Microsoft sets the OID of the Public RSA key to
-	   the oid for "MD5 with RSA Encryption" instead of "RSA Encryption"
+	uint8 signature[SEC_MAX_MODULUS_SIZE];
+	uint32 sig_len;
 
-	   Kudos to Richard Levitte for the following (. intiutive .)
-	   lines of code that resets the OID and let's us extract the key. */
-	if (OBJ_obj2nid(cert->cert_info->key->algor->algorithm) == NID_md5WithRSAEncryption || OBJ_obj2nid(cert->cert_info->key->algor->algorithm) == NID_shaWithRSAEncryption)
+	if (len != 72)
 	{
-		DEBUG_RDP5(("Re-setting algorithm type to RSA in server certificate\n"));
-		ASN1_OBJECT_free(cert->cert_info->key->algor->algorithm);
-		cert->cert_info->key->algor->algorithm = OBJ_nid2obj(NID_rsaEncryption);
+		return True;
 	}
-	epk = X509_get_pubkey(cert);
-	if (NULL == epk)
-	{
-		error("Failed to extract public key from certificate\n");
-		return False;
-	}
-
-	conn->serverPublicKey = RSAPublicKey_dup((RSA *) epk->pkey.ptr);
-
-	conn->serverPublicKeyLen = RSA_size(conn->serverPublicKey);
-	if ((conn->serverPublicKeyLen < 64) || (conn->serverPublicKeyLen > SEC_MAX_MODULUS_SIZE))
-	{
-		error("Bad server public key size (%u bits)\n", conn->serverPublicKeyLen * 8);
-		return False;
-	}
-
-	return True;
+	memset(signature, 0, sizeof(signature));
+	sig_len = len - 8;
+	in_uint8a(s, signature, sig_len);
+	return ssl_sig_ok(exponent, SEC_EXPONENT_SIZE, modulus, conn->serverPublicKeyLen,
+			    signature, sig_len);
 }
-
 
 /* Parse a crypto information structure */
 static RD_BOOL
 sec_parse_crypt_info(RDConnectionRef conn, RDStreamRef s, uint32 * rc4_key_size,
-		     uint8 ** server_random, uint8 ** modulus, uint8 ** exponent)
+		     uint8 ** server_random, uint8 * modulus, uint8 * exponent)
 {
 	uint32 crypt_level, random_len, rsa_info_len;
 	uint32 cacert_len, cert_len, flags;
 	X509 *cacert, *server_cert;
+	SSL_RKEY *server_public_key;
 	uint16 tag, length;
 	uint8 *next_tag, *end;
 
 	in_uint32_le(s, *rc4_key_size);	/* 1 = 40-bit, 2 = 128-bit */
 	in_uint32_le(s, crypt_level);	/* 1 = low, 2 = medium, 3 = high */
-	if (crypt_level == 0)	/* no encryption */
+	if (crypt_level == 0)  /* no encryption */
+	{
+		/* no encryption */
+		DEBUG(( "sec_parse_crypt_info(), got ENCRYPTION_LEVEL_NONE"));
 		return False;
+	}
+
 	in_uint32_le(s, random_len);
 	in_uint32_le(s, rsa_info_len);
 
 	if (random_len != SEC_RANDOM_SIZE)
 	{
-		error("random len %d, expected %d\n", random_len, SEC_RANDOM_SIZE);
+		error("sec_parse_crypt_info(), got random len %d, expected %d", random_len, SEC_RANDOM_SIZE);
 		return False;
 	}
 
@@ -549,12 +709,15 @@ sec_parse_crypt_info(RDConnectionRef conn, RDStreamRef s, uint32 * rc4_key_size,
 	/* RSA info */
 	end = s->p + rsa_info_len;
 	if (end > s->end)
+	{
+		error("sec_parse_crypt_info(), end > s->end");
 		return False;
+	}
 
 	in_uint32_le(s, flags);	/* 1 = RDP4-style, 0x80000002 = X.509 */
 	if (flags & 1)
 	{
-		DEBUG_RDP5(("We're going for the RDP4-style encryption\n"));
+		DEBUG_RDP5(("sec_parse_crypt_info(), We're going for the RDP4-style encryption"));
 		in_uint8s(s, 8);	/* unknown */
 
 		while (s->p < end)
@@ -568,20 +731,24 @@ sec_parse_crypt_info(RDConnectionRef conn, RDStreamRef s, uint32 * rc4_key_size,
 			{
 				case SEC_TAG_PUBKEY:
 					if (!sec_parse_public_key(conn, s, modulus, exponent))
+					{
+						error("sec_parse_crypt_info(), invalid public key");
 						return False;
-					DEBUG_RDP5(("Got Public key, RDP4-style\n"));
+					}
+					DEBUG_RDP5(("sec_parse_crypt_info(), got public key"));
 
 					break;
 
 				case SEC_TAG_KEYSIG:
-					/* Is this a Microsoft key that we just got? */
-					/* Care factor: zero! */
-					/* Actually, it would probably be a good idea to check if the public key is signed with this key, and then store this 
-					   key as a known key of the hostname. This would prevent some MITM-attacks. */
+					if (!sec_parse_public_sig(conn, s, length, modulus, exponent))
+					{
+						error("sec_parse_crypt_info(), invalid public sig");
+						return False;
+					}
 					break;
 
 				default:
-					unimpl("crypt tag 0x%x\n", tag);
+					DEBUG(("sec_parse_crypt_info(), unhandled crypt tag 0x%x",tag));
 			}
 
 			s->p = next_tag;
@@ -591,29 +758,27 @@ sec_parse_crypt_info(RDConnectionRef conn, RDStreamRef s, uint32 * rc4_key_size,
 	{
 		uint32 certcount;
 
-		DEBUG_RDP5(("We're going for the RDP5-style encryption\n"));
+		DEBUG_RDP5(("sec_parse_crypt_info(), We're going for the RDP5-style encryption"));
 		in_uint32_le(s, certcount);	/* Number of certificates */
-
 		if (certcount < 2)
 		{
-			error("Server didn't send enough X509 certificates\n");
+			error("sec_parse_crypt_info(), server didn't send enough x509 certificates");
 			return False;
 		}
-
 		for (; certcount > 2; certcount--)
 		{		/* ignore all the certificates between the root and the signing CA */
 			uint32 ignorelen;
 			X509 *ignorecert;
 
 			DEBUG_RDP5(("Ignored certs left: %d\n", certcount));
-
 			in_uint32_le(s, ignorelen);
 			DEBUG_RDP5(("Ignored Certificate length is %d\n", ignorelen));
 			ignorecert = d2i_X509(NULL, (const unsigned char**)&(s->p), ignorelen);
 
+			in_uint8s(s, ignorelen);
 			if (ignorecert == NULL)
 			{	/* XXX: error out? */
-				DEBUG_RDP5(("got a bad cert: this will probably screw up the rest of the communication\n"));
+				error("sec_parse_crypt_info(), got a bad cert: this will probably screw up the rest of the communication");
 			}
 
 #ifdef WITH_DEBUG_RDP5
@@ -622,7 +787,7 @@ sec_parse_crypt_info(RDConnectionRef conn, RDStreamRef s, uint32 * rc4_key_size,
 #endif
 		}
 
-		/* Do da funky X.509 stuffy 
+		/* Do da funky X.509 stuffy
 
 		   "How did I find out about this?  I looked up and saw a
 		   bright light and when I came to I had a scar on my forehead
@@ -630,51 +795,60 @@ sec_parse_crypt_info(RDConnectionRef conn, RDStreamRef s, uint32 * rc4_key_size,
 		   - Peter Gutman in a early version of 
 		   http://www.cs.auckland.ac.nz/~pgut001/pubs/x509guide.txt
 		 */
-
 		in_uint32_le(s, cacert_len);
-		DEBUG_RDP5(("CA Certificate length is %d\n", cacert_len));
+		DEBUG(("sec_parse_crypt_info(), server CA Certificate length is %d", cacert_len));
 		cacert = d2i_X509(NULL, (const unsigned char**)&(s->p), cacert_len);
 		/* Note: We don't need to move s->p here - d2i_X509 is
 		   "kind" enough to do it for us */
+		in_uint8s(s, cacert_len);
 		if (NULL == cacert)
 		{
-			error("Couldn't load CA Certificate from server\n");
+			error("sec_parse_crypt_info(), couldn't load CA Certificate from server");
 			return False;
 		}
-
-		/* Currently, we don't use the CA Certificate. 
-		   FIXME: 
-		   *) Verify the server certificate (server_cert) with the 
-		   CA certificate.
-		   *) Store the CA Certificate with the hostname of the 
-		   server we are connecting to as key, and compare it
-		   when we connect the next time, in order to prevent
-		   MITM-attacks.
-		 */
-		X509_free(cacert);
-		
 		in_uint32_le(s, cert_len);
-		DEBUG_RDP5(("Certificate length is %d\n", cert_len));
-        server_cert = d2i_X509(NULL, (const unsigned char**)&(s->p), cert_len);
+		DEBUG(("sec_parse_crypt_info(), certificate length is %d",cert_len));
+		server_cert = d2i_X509(NULL, (const unsigned char**)&(s->p), cert_len);
+		in_uint8s(s, cert_len);
 		if (NULL == server_cert)
 		{
-			error("Couldn't load Certificate from server\n");
+			X509_free(cacert);
+			error("sec_parse_crypt_info(), couldn't load Certificate from server");
 			return False;
 		}
-
-		in_uint8s(s, 16);	/* Padding */
-
-		/* Note: Verifying the server certificate must be done here, 
-		   before sec_parse_public_key since we'll have to apply
-		   serious violence to the key after this */
-
-		if (!sec_parse_x509_key(conn, server_cert))
+		if (!ssl_certs_ok(server_cert, cacert))
 		{
-			DEBUG_RDP5(("Didn't parse X509 correctly\n"));
+			X509_free(server_cert);
+			X509_free(cacert);
+			error("sec_parse_crypt_info(), security error, CA Certificate invalid");
+			return False;
+		}
+		X509_free(cacert);
+		in_uint8s(s, 16);	/* Padding */
+		server_public_key = ssl_cert_to_rkey(server_cert, &conn->serverPublicKeyLen);
+		if (NULL == server_public_key)
+		{
+			DEBUG_RDP5(("sec_parse_crypt_info(). failed to parse X509 correctly"));
 			X509_free(server_cert);
 			return False;
 		}
 		X509_free(server_cert);
+		if ((conn->serverPublicKeyLen < SEC_MODULUS_SIZE) ||
+		    (conn->serverPublicKeyLen > SEC_MAX_MODULUS_SIZE))
+		{
+			error("sec_parse_crypt_info(), bad server public key size (%u bits)",
+			       conn->serverPublicKeyLen * 8);
+			ssl_rkey_free(server_public_key);
+			return False;
+		}
+		if (ssl_rkey_get_exp_mod(server_public_key, exponent, SEC_EXPONENT_SIZE,
+					   *modulus, SEC_MAX_MODULUS_SIZE) != 0)
+		{
+			error("sec_parse_crypt_info(), problem extracting RSA exponent, modulus");
+			ssl_rkey_free(server_public_key);
+			return False;
+		}
+		ssl_rkey_free(server_public_key);
 		return True;	/* There's some garbage here we don't care about */
 	}
 	return s_check_end(s);
@@ -684,21 +858,25 @@ sec_parse_crypt_info(RDConnectionRef conn, RDStreamRef s, uint32 * rc4_key_size,
 static void
 sec_process_crypt_info(RDConnectionRef conn, RDStreamRef s)
 {
-	uint8 *server_random = NULL, *modulus = NULL, *exponent = NULL;
+	uint8 *server_random = NULL;
+	uint8 modulus[SEC_MAX_MODULUS_SIZE];
+	uint8 exponent[SEC_EXPONENT_SIZE];
 	uint32 rc4_key_size;
 
-	if (!sec_parse_crypt_info(conn, s, &rc4_key_size, &server_random, &modulus, &exponent))
-	{
-		DEBUG(("Failed to parse crypt info\n"));
-		return;
-	}
+	memset(modulus, 0, sizeof(modulus));
+	memset(exponent, 0, sizeof(exponent));
+	if (!sec_parse_crypt_info(conn, s, &rc4_key_size, &server_random, modulus, exponent))
+		{
+			DEBUG(("Failed to parse crypt info\n"));
+			return;
+		}
 
-	DEBUG(("Generating client random\n"));
+	DEBUG(("sec_parse_crypt_info(), generating client random"));
 	generate_random(conn->autoReconnectClientRandom);
-	
 	if (NULL != conn->serverPublicKey)
 	{			/* Which means we should use 
 				   RDP5-style encryption */
+		DEBUG(("sec_process_crypt_info(), NULL != conn->serverPublicKey"));
 		uint8 inr[SEC_MAX_MODULUS_SIZE];
 		uint32 padding_len = conn->serverPublicKeyLen - SEC_RANDOM_SIZE;
 
@@ -735,10 +913,10 @@ static void
 sec_process_srv_info(RDConnectionRef conn, RDStreamRef s)
 {
 	in_uint16_le(s, conn->serverRdpVersion);
-	DEBUG_RDP5(("Server RDP version is %d\n", conn->serverRdpVersion));
+	DEBUG_RDP5(("sec_process_srv_info(), server RDP version is %d",conn->serverRdpVersion));
 	if (1 == conn->serverRdpVersion)
 	{
-		conn->useRdp5 = 0;
+		conn->useRdp5 = 4;
 		conn->serverBpp = 8;
 	}
 }
@@ -784,7 +962,7 @@ sec_process_mcs_data(RDConnectionRef conn, RDStreamRef s)
 				break;
 
 			default:
-				unimpl("response tag 0x%x\n", tag);
+				unimpl(("Unhandled response tag 0x%x", tag));
 		}
 
 		s->p = next_tag;
@@ -795,7 +973,7 @@ sec_process_mcs_data(RDConnectionRef conn, RDStreamRef s)
 RDStreamRef
 sec_recv(RDConnectionRef conn, uint8 * rdpver)
 {
-	uint32 sec_flags;
+	uint16 sec_flags;
 	uint16 channel;
 	RDStreamRef s;
 
@@ -815,52 +993,66 @@ sec_recv(RDConnectionRef conn, uint8 * rdpver)
 		}
 		if (conn->useEncryption || !conn->licenseIssued)
 		{
-			in_uint32_le(s, sec_flags);
+			/* TS_SECURITY_HEADER */
+			in_uint16_le(s, sec_flags);
+			in_uint8s(s, 2);                        /* skip sec_flags_hi */
 
-			if (sec_flags & SEC_ENCRYPT)
+			if (conn->useEncryption)
 			{
-				in_uint8s(s, 8);	/* signature */
-				sec_decrypt(conn, s->p, s->end - s->p);
-			}
-
-			if (sec_flags & SEC_LICENCE_NEG)
-			{
-				licence_process(conn, s);
-				continue;
-			}
-			
-			if (sec_flags & 0x0400)	/* SEC_REDIRECT_ENCRYPT */
-			{
-				uint8 swapbyte;
-
-				in_uint8s(s, 8);	/* signature */
-				sec_decrypt(conn, s->p, s->end - s->p);
-
-				/* Check for a redirect packet, starts with 00 04 */
-				if (s->p[0] == 0 && s->p[1] == 4)
+				if (sec_flags & SEC_ENCRYPT)
 				{
-					/* for some reason the PDU and the length seem to be swapped.
-					   This isn't good, but we're going to do a byte for byte
-					   swap.  So the first foure value appear as: 00 04 XX YY,
-					   where XX YY is the little endian length. We're going to
-					   use 04 00 as the PDU type, so after our swap this will look
-					   like: XX YY 04 00 */
-					swapbyte = s->p[0];
-					s->p[0] = s->p[2];
-					s->p[2] = swapbyte;
-
-					swapbyte = s->p[1];
-					s->p[1] = s->p[3];
-					s->p[3] = swapbyte;
-
-					swapbyte = s->p[2];
-					s->p[2] = s->p[3];
-					s->p[3] = swapbyte;
+					in_uint8s(s, 8);	/* signature */
+					sec_decrypt(conn, s->p, s->end - s->p);
 				}
+
+				if (sec_flags & SEC_LICENSE_PKT)
+				{
+					licence_process(conn, s);
+					continue;
+				}
+
+				if (sec_flags & SEC_REDIRECTION_PKT)
+				{
+					uint8 swapbyte;
+
+					in_uint8s(s, 8);	/* signature */
+					sec_decrypt(conn, s->p, s->end - s->p);
+
+					/* Check for a redirect packet, starts with 00 04 */
+					if (s->p[0] == 0 && s->p[1] == 4)
+					{
+						/* for some reason the PDU and the length seem to be swapped.
+						   This isn't good, but we're going to do a byte for byte
+						   swap.  So the first four value appear as: 00 04 XX YY,
+						   where XX YY is the little endian length. We're going to
+						   use 04 00 as the PDU type, so after our swap this will look
+						   like: XX YY 04 00 */
+						swapbyte = s->p[0];
+						s->p[0] = s->p[2];
+						s->p[2] = swapbyte;
+
+						swapbyte = s->p[1];
+						s->p[1] = s->p[3];
+						s->p[3] = swapbyte;
+
+						swapbyte = s->p[2];
+						s->p[2] = s->p[3];
+						s->p[3] = swapbyte;
+					}
 #ifdef WITH_DEBUG
 				/* warning!  this debug statement will show passwords in the clear! */
 				hexdump(s->p, s->end - s->p);
 #endif
+				}
+			}
+			else
+			{
+				if (sec_flags & SEC_LICENSE_PKT)
+				{
+					licence_process(conn, s);
+					continue;
+				}
+				s->p -= 4;
 			}
 		}
 
@@ -880,22 +1072,25 @@ sec_recv(RDConnectionRef conn, uint8 * rdpver)
 
 /* Establish a secure connection */
 RD_BOOL
-sec_connect(RDConnectionRef conn, const char *server, char *username, RD_BOOL reconnect)
+sec_connect(RDConnectionRef conn, char *server, char *username, char *domain, char *password, RD_BOOL reconnect)
 {
+	uint32 selected_proto;
 	RDStream mcs_data;
+
+	/* Start a MCS connect sequence */
+	if (!mcs_connect_start(conn, server, username, domain, password, reconnect, &selected_proto))
+		return False;
 
 	/* We exchange some RDP data during the MCS-Connect */
 	mcs_data.size = 512;
 	mcs_data.p = mcs_data.data = (uint8 *) xmalloc(mcs_data.size);
-	sec_out_mcs_data(conn, &mcs_data);
+	sec_out_mcs_connect_initial_pdu(conn, &mcs_data, selected_proto);
 
-	if (!mcs_connect(conn, server, &mcs_data, username, reconnect))
-	{
-		xfree(mcs_data.data);
+	/* finalize the MCS connect sequence */
+	if (!mcs_connect_finalize(conn, &mcs_data))
 		return False;
-	}
-	
-	/*      sec_process_mcs_data(&mcs_data); */
+
+	/* sec_process_mcs_data(&mcs_data); */
 	if (conn->useEncryption)
 		sec_establish_key(conn);
 	xfree(mcs_data.data);
@@ -916,5 +1111,6 @@ sec_reset_state(RDConnectionRef conn)
 	conn->serverRdpVersion = 0;
 	conn->secEncryptUseCount = 0;
 	conn->secDecryptUseCount = 0;
+	conn->licenseIssued = 0;
 	mcs_reset_state(conn);
 }

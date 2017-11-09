@@ -460,3 +460,11 @@ enum RDP_INPUT_DEVICE
 
 #import "disk.h"
 #import "scancodes.h"
+
+#define RDP_V5 5
+enum RDP_NEG_TYPE_CODE
+{
+	RDP_NEG_REQ = 1,
+	RDP_NEG_RSP = 2,
+	RDP_NEG_FAILURE = 3
+};
